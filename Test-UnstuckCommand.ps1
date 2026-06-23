@@ -24,7 +24,7 @@ if ($errors -and $errors.Count -gt 0) {
 
 Write-Host "Parser PASS"
 
-$proc = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$launcher`" -DryRun -SampleSeconds 1 -PostActionWaitSeconds 1 -MaxMonitorSeconds 1") -Wait -PassThru -NoNewWindow
+$proc = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$launcher`" -DryRun -NoTray -SampleSeconds 1 -PostActionWaitSeconds 1 -MaxMonitorSeconds 1") -Wait -PassThru -NoNewWindow
 if ($proc.ExitCode -ne 0) {
     throw "Launcher dry-run failed with exit code $($proc.ExitCode)"
 }

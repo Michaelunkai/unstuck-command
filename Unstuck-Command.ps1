@@ -7,6 +7,8 @@ param(
     [switch]$Aggressive,
     [switch]$IncludeGenericReport,
     [switch]$RerunDism,
+    [switch]$NoTray,
+    [int]$SelfExitAfterSeconds = 0,
     [double]$MinCpuDelta = 0.01,
     [int]$MaxMonitorSeconds = 300,
     [int]$MonitorIntervalSeconds = 10,
@@ -16,12 +18,103 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:StopRequested = $false
+$script:TrayIcon = $null
+$script:TrayTimer = $null
+$script:StartedDismIds = New-Object System.Collections.Generic.List[int]
 
 function Write-Status {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line
+}
+
+function Initialize-TrayIcon {
+    if ($NoTray) {
+        Write-Status "tray icon disabled by -NoTray."
+        return
+    }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        $menu = [System.Windows.Forms.ContextMenuStrip]::new()
+        $statusItem = [System.Windows.Forms.ToolStripMenuItem]::new("unstuck-command running")
+        $statusItem.Enabled = $false
+        $exitItem = [System.Windows.Forms.ToolStripMenuItem]::new("Exit and stop")
+        $exitItem.Add_Click({
+            $script:StopRequested = $true
+            Write-Status "tray exit requested; stopping monitor."
+        })
+        [void]$menu.Items.Add($statusItem)
+        [void]$menu.Items.Add("-")
+        [void]$menu.Items.Add($exitItem)
+
+        $script:TrayIcon = [System.Windows.Forms.NotifyIcon]::new()
+        $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Shield
+        $script:TrayIcon.Text = "unstuck-command running"
+        $script:TrayIcon.ContextMenuStrip = $menu
+        $script:TrayIcon.Visible = $true
+        Write-Status "tray icon created; use Exit and stop to end this monitor."
+
+        if ($SelfExitAfterSeconds -gt 0) {
+            $script:TrayTimer = [System.Windows.Forms.Timer]::new()
+            $script:TrayTimer.Interval = [Math]::Max(1, $SelfExitAfterSeconds) * 1000
+            $script:TrayTimer.Add_Tick({
+                $this.Stop()
+                $this.Dispose()
+                $script:StopRequested = $true
+                Write-Status "self-exit timer requested stop; this uses the same stop path as tray exit."
+            })
+            $script:TrayTimer.Start()
+        }
+    } catch {
+        Write-Status ("WARNING tray icon could not be created: {0}" -f $_.Exception.Message)
+        throw
+    }
+}
+
+function Invoke-TrayEvents {
+    if ($script:TrayIcon -ne $null) {
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+function Wait-WithTrayEvents {
+    param([int]$Seconds)
+    $end = (Get-Date).AddSeconds([Math]::Max(0, $Seconds))
+    while ((Get-Date) -lt $end) {
+        Invoke-TrayEvents
+        if ($script:StopRequested) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+    Invoke-TrayEvents
+    return (-not $script:StopRequested)
+}
+
+function Stop-StartedDismProcesses {
+    foreach ($id in @($script:StartedDismIds)) {
+        $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+        if ($proc) {
+            Stop-TargetProcess -Process $proc -Reason "tray exit cleanup for DISM started by unstuck-command"
+        }
+    }
+}
+
+function Dispose-TrayIcon {
+    if ($script:TrayTimer -ne $null) {
+        $script:TrayTimer.Stop()
+        $script:TrayTimer.Dispose()
+        $script:TrayTimer = $null
+    }
+    if ($script:TrayIcon -ne $null) {
+        $script:TrayIcon.Visible = $false
+        $script:TrayIcon.Dispose()
+        $script:TrayIcon = $null
+        Write-Status "tray icon removed."
+    }
 }
 
 function Test-IsAdmin {
@@ -137,6 +230,7 @@ function Start-DismRestoreHealth {
     Write-Status "ACTION start DISM $args"
     if (-not $DryRun) {
         $proc = Start-Process -FilePath $dism -ArgumentList $args -PassThru -WindowStyle Hidden
+        [void]$script:StartedDismIds.Add([int]$proc.Id)
         Write-Status ("started DISM PID={0}" -f $proc.Id)
     }
 }
@@ -184,7 +278,10 @@ function Invoke-ServicingUnstuck {
         CbsLog = Get-FileSnapshot $cbsLogPath
     }
 
-    Start-Sleep -Seconds $SampleSeconds
+    if (-not (Wait-WithTrayEvents -Seconds $SampleSeconds)) {
+        Write-Status "stop requested during sample wait."
+        return
+    }
 
     $after = @{
         Dism = @(Get-ProcByName @("Dism"))
@@ -252,7 +349,10 @@ function Invoke-ServicingUnstuck {
         }
     }
 
-    Start-Sleep -Seconds $PostActionWaitSeconds
+    if (-not (Wait-WithTrayEvents -Seconds $PostActionWaitSeconds)) {
+        Write-Status "stop requested during post-action wait."
+        return
+    }
 
     $postDism = @(Get-ProcByName @("Dism"))
     $postRepairDism = @(Get-DismRepairProcess -Processes $postDism)
@@ -275,7 +375,10 @@ function Show-GenericStaleReport {
     $names = "cmd","powershell","pwsh","python","node","git","robocopy","xcopy","chkdsk","tar","7z","winget","npm","pnpm","yarn"
     $before = @{}
     Get-ProcByName $names | ForEach-Object { $before[$_.Id] = $_.CPU }
-    Start-Sleep -Seconds $SampleSeconds
+    if (-not (Wait-WithTrayEvents -Seconds $SampleSeconds)) {
+        Write-Status "stop requested during generic report wait."
+        return
+    }
     $map = Get-ProcMap
     foreach ($proc in (Get-ProcByName $names)) {
         $oldCpu = if ($before.ContainsKey($proc.Id)) { $before[$proc.Id] } else { $proc.CPU }
@@ -291,35 +394,58 @@ function Show-GenericStaleReport {
     }
 }
 
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
-Write-Status "unstuck-command start DryRun=$DryRun Aggressive=$Aggressive RerunDism=$RerunDism IncludeGenericReport=$IncludeGenericReport SampleSeconds=$SampleSeconds MaxMonitorSeconds=$MaxMonitorSeconds"
+try {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
+    Write-Status "unstuck-command start DryRun=$DryRun Aggressive=$Aggressive RerunDism=$RerunDism IncludeGenericReport=$IncludeGenericReport NoTray=$NoTray SampleSeconds=$SampleSeconds MaxMonitorSeconds=$MaxMonitorSeconds"
+    Initialize-TrayIcon
 
-if (-not (Test-IsAdmin)) {
-    Write-Status "WARNING not elevated. Detection works, but stopping service-owned workers may fail. Run the .cmd launcher as Administrator for full repair."
-}
-
-$deadline = (Get-Date).AddSeconds([Math]::Max(1, $MaxMonitorSeconds))
-$pass = 0
-do {
-    $pass++
-    Write-Status "monitor pass $pass"
-    Invoke-ServicingUnstuck
-    $activeRepair = @(Get-DismRepairProcess -Processes @(Get-ProcByName @("Dism")))
-    if ($activeRepair.Count -eq 0) {
-        Write-Status "no active RestoreHealth repair after pass $pass."
-        break
+    if (-not (Test-IsAdmin)) {
+        Write-Status "WARNING not elevated. Detection works, but stopping service-owned workers may fail. Run the .cmd launcher as Administrator for full repair."
     }
-    if ((Get-Date) -ge $deadline) {
-        Write-Status ("monitor timeout reached with active RestoreHealth PID={0}" -f ($activeRepair.Id -join ","))
-        break
-    }
-    Write-Status ("active RestoreHealth PID={0}; next monitor pass in {1}s" -f ($activeRepair.Id -join ","), $MonitorIntervalSeconds)
-    Start-Sleep -Seconds $MonitorIntervalSeconds
-} while ($true)
 
-if ($IncludeGenericReport) {
-    Show-GenericStaleReport
-} else {
-    Write-Status "generic stale-process report skipped; add -IncludeGenericReport for read-only candidate listing."
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $MaxMonitorSeconds))
+    $pass = 0
+    do {
+        Invoke-TrayEvents
+        if ($script:StopRequested) {
+            Write-Status "monitor stopped by tray exit before pass."
+            break
+        }
+
+        $pass++
+        Write-Status "monitor pass $pass"
+        Invoke-ServicingUnstuck
+
+        if ($script:StopRequested) {
+            Write-Status "monitor stopped by tray exit after pass $pass."
+            break
+        }
+
+        $activeRepair = @(Get-DismRepairProcess -Processes @(Get-ProcByName @("Dism")))
+        if ($activeRepair.Count -eq 0) {
+            Write-Status "no active RestoreHealth repair after pass $pass."
+            break
+        }
+        if ((Get-Date) -ge $deadline) {
+            Write-Status ("monitor timeout reached with active RestoreHealth PID={0}" -f ($activeRepair.Id -join ","))
+            break
+        }
+        Write-Status ("active RestoreHealth PID={0}; next monitor pass in {1}s" -f ($activeRepair.Id -join ","), $MonitorIntervalSeconds)
+        if (-not (Wait-WithTrayEvents -Seconds $MonitorIntervalSeconds)) {
+            Write-Status "monitor stopped by tray exit during interval wait."
+            break
+        }
+    } while ($true)
+
+    if ($IncludeGenericReport -and -not $script:StopRequested) {
+        Show-GenericStaleReport
+    } elseif (-not $IncludeGenericReport) {
+        Write-Status "generic stale-process report skipped; add -IncludeGenericReport for read-only candidate listing."
+    }
+} finally {
+    if ($script:StopRequested) {
+        Stop-StartedDismProcesses
+    }
+    Dispose-TrayIcon
+    Write-Status "unstuck-command complete. Log: $LogPath"
 }
-Write-Status "unstuck-command complete. Log: $LogPath"

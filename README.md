@@ -16,10 +16,12 @@ With no arguments, the launcher runs:
 Unstuck-Command.ps1 -Aggressive -RerunDism -MaxMonitorSeconds 300
 ```
 
+Normal launches create a system tray icon. The monitor keeps running while that icon is present. Choosing `Exit and stop` from the tray icon stops the monitor and cleans up any DISM process started by this script.
+
 For a safe inspection-only pass:
 
 ```cmd
-unstuck-command.cmd -DryRun -Aggressive -RerunDism -MaxMonitorSeconds 20
+unstuck-command.cmd -DryRun -NoTray -Aggressive -RerunDism -MaxMonitorSeconds 20
 ```
 
 ## What It Targets
