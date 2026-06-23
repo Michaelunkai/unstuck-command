@@ -7,6 +7,9 @@ param(
     [switch]$Aggressive,
     [switch]$IncludeGenericReport,
     [switch]$RerunDism,
+    [double]$MinCpuDelta = 0.01,
+    [int]$MaxMonitorSeconds = 300,
+    [int]$MonitorIntervalSeconds = 10,
     [string]$DismSource = "C:\Temp\codex-repair-source\sources\install.esd",
     [int]$DismSourceIndex = 6,
     [string]$LogPath = "$env:TEMP\unstuck-command.log"
@@ -41,6 +44,51 @@ function Get-ProcMap {
 function Get-CimProc {
     param([int]$Id)
     Get-CimInstance Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue
+}
+
+function Get-CommandLine {
+    param([int]$Id)
+    $proc = Get-CimProc -Id $Id
+    if ($proc) { return [string]$proc.CommandLine }
+    return ""
+}
+
+function Get-CpuDelta {
+    param(
+        [object[]]$Before,
+        [object[]]$After
+    )
+    $sum = 0.0
+    foreach ($proc in $After) {
+        $old = $Before | Where-Object { $_.Id -eq $proc.Id } | Select-Object -First 1
+        if ($old) {
+            $sum += [double]($proc.CPU - $old.CPU)
+        }
+    }
+    return $sum
+}
+
+function Get-DismRepairProcess {
+    param([object[]]$Processes)
+    foreach ($proc in $Processes) {
+        $cmd = Get-CommandLine -Id $proc.Id
+        if ($cmd -match '(?i)/cleanup-image' -and $cmd -match '(?i)/restorehealth') {
+            $proc
+        }
+    }
+}
+
+function Get-DismHostForParent {
+    param(
+        [object[]]$Hosts,
+        [int[]]$ParentIds
+    )
+    foreach ($hostProc in $Hosts) {
+        $cim = Get-CimProc -Id $hostProc.Id
+        if ($cim -and ($ParentIds -contains [int]$cim.ParentProcessId)) {
+            $hostProc
+        }
+    }
 }
 
 function Get-FileSnapshot {
@@ -93,6 +141,28 @@ function Start-DismRestoreHealth {
     }
 }
 
+function Stop-DismRepairSession {
+    param(
+        [object[]]$DismProcesses,
+        [object[]]$DismHosts,
+        [string]$Reason
+    )
+    $repairDism = @(Get-DismRepairProcess -Processes $DismProcesses)
+    if ($repairDism.Count -eq 0) {
+        Write-Status "no RestoreHealth DISM process found to recycle."
+        return
+    }
+
+    $repairIds = @($repairDism | ForEach-Object { [int]$_.Id })
+    $repairHosts = @(Get-DismHostForParent -Hosts $DismHosts -ParentIds $repairIds)
+    foreach ($hostProc in $repairHosts) {
+        Stop-TargetProcess -Process $hostProc -Reason ("DismHost for stale RestoreHealth: {0}" -f $Reason)
+    }
+    foreach ($dismProc in $repairDism) {
+        Stop-TargetProcess -Process $dismProc -Reason ("stale RestoreHealth: {0}" -f $Reason)
+    }
+}
+
 function Get-RecentDismFailure {
     $dismLog = "$env:WINDIR\Logs\DISM\dism.log"
     if (-not (Test-Path -LiteralPath $dismLog)) { return $false }
@@ -127,7 +197,11 @@ function Invoke-ServicingUnstuck {
     }
 
     $dismActive = $after.Dism.Count -gt 0
-    $sfcActive = $after.Sfc.Count -gt 0
+    $repairDism = @(Get-DismRepairProcess -Processes $after.Dism)
+    $repairDismActive = $repairDism.Count -gt 0
+    $dismCpuDelta = Get-CpuDelta -Before $before.Dism -After $after.Dism
+    $hostCpuDelta = Get-CpuDelta -Before $before.DismHost -After $after.DismHost
+    $tiCpuDelta = Get-CpuDelta -Before $before.TiWorker -After $after.TiWorker
     $dismLogChanged = $after.DismLog.Exists -and (
         $after.DismLog.LastWriteTime -gt $before.DismLog.LastWriteTime -or
         $after.DismLog.Length -ne $before.DismLog.Length
@@ -139,8 +213,8 @@ function Invoke-ServicingUnstuck {
     $dismLogAge = if ($after.DismLog.Exists) { ((Get-Date) - $after.DismLog.LastWriteTime).TotalSeconds } else { [double]::PositiveInfinity }
     $cbsLogAge = if ($after.CbsLog.Exists) { ((Get-Date) - $after.CbsLog.LastWriteTime).TotalSeconds } else { [double]::PositiveInfinity }
 
-    Write-Status ("sample DISM={0} SFC={1} TiWorker={2} DISMLogChanged={3} CBSLogChanged={4} DISMLogAgeSec={5:n0} CBSLogAgeSec={6:n0}" -f `
-        ($after.Dism.Id -join ","), ($after.Sfc.Id -join ","), ($after.TiWorker.Id -join ","), $dismLogChanged, $cbsLogChanged, $dismLogAge, $cbsLogAge)
+    Write-Status ("sample DISM={0} RepairDISM={1} SFC={2} TiWorker={3} DISMCPU={4:n3} HostCPU={5:n3} TiCPU={6:n3} DISMLogChanged={7} CBSLogChanged={8} DISMLogAgeSec={9:n0} CBSLogAgeSec={10:n0}" -f `
+        ($after.Dism.Id -join ","), ($repairDism.Id -join ","), ($after.Sfc.Id -join ","), ($after.TiWorker.Id -join ","), $dismCpuDelta, $hostCpuDelta, $tiCpuDelta, $dismLogChanged, $cbsLogChanged, $dismLogAge, $cbsLogAge)
 
     foreach ($sfc in $after.Sfc) {
         $cim = Get-CimProc -Id $sfc.Id
@@ -150,7 +224,7 @@ function Invoke-ServicingUnstuck {
         }
         $sfcBefore = $before.Sfc | Where-Object { $_.Id -eq $sfc.Id } | Select-Object -First 1
         $cpuDelta = if ($sfcBefore) { $sfc.CPU - $sfcBefore.CPU } else { 0 }
-        $staleSfc = ($cpuDelta -lt 0.01) -and (-not $cbsLogChanged) -and (($dismActive -and $dismLogAge -ge $StaleLogSeconds) -or (-not $parentAlive))
+        $staleSfc = ($cpuDelta -lt $MinCpuDelta) -and (-not $cbsLogChanged) -and (($dismActive -and $dismLogAge -ge $StaleLogSeconds) -or (-not $parentAlive))
         if ($staleSfc) {
             Stop-TargetProcess -Process $sfc -Reason ("stale SFC blocks CBS; parentAlive={0}; cpuDelta={1:n3}" -f $parentAlive, $cpuDelta)
         } else {
@@ -158,11 +232,20 @@ function Invoke-ServicingUnstuck {
         }
     }
 
-    if ($dismActive -and -not $dismLogChanged -and -not $cbsLogChanged -and $dismLogAge -ge $StaleLogSeconds -and $cbsLogAge -ge $StaleLogSeconds) {
-        Write-Status "stalled servicing stack detected: active DISM with no DISM/CBS log movement."
+    $recycledRepair = $false
+    $dismSelfStale = $repairDismActive -and -not $dismLogChanged -and ($dismLogAge -ge $StaleLogSeconds) -and (($dismCpuDelta + $hostCpuDelta) -lt $MinCpuDelta)
+    if ($dismSelfStale) {
+        Write-Status "stalled DISM RestoreHealth detected: no DISM log movement and no DISM/DismHost CPU movement. CBS chatter is ignored for this decision."
+        if ($Aggressive) {
+            Stop-DismRepairSession -DismProcesses $after.Dism -DismHosts $after.DismHost -Reason "no repair progress"
+            $recycledRepair = $true
+        } else {
+            Write-Status "would recycle stale DISM RestoreHealth; rerun with -Aggressive to force it."
+        }
+
         foreach ($ti in $after.TiWorker) {
             if ($Aggressive) {
-                Stop-TargetProcess -Process $ti -Reason "aggressive stale TiWorker recycle for DISM/CBS deadlock"
+                Stop-TargetProcess -Process $ti -Reason "recycle TiWorker after stale DISM repair"
             } else {
                 Write-Status ("would recycle TiWorker PID={0}; rerun with -Aggressive to force it" -f $ti.Id)
             }
@@ -172,11 +255,17 @@ function Invoke-ServicingUnstuck {
     Start-Sleep -Seconds $PostActionWaitSeconds
 
     $postDism = @(Get-ProcByName @("Dism"))
-    if ($postDism.Count -eq 0 -and (Get-RecentDismFailure)) {
-        Write-Status "recent DISM failure found after unstuck pass."
+    $postRepairDism = @(Get-DismRepairProcess -Processes $postDism)
+    if ($DryRun -and $recycledRepair) {
+        Write-Status "DRYRUN planned stale RestoreHealth recycle completed; relaunch check follows."
         Start-DismRestoreHealth
+    } elseif (($recycledRepair -or (Get-RecentDismFailure)) -and $postRepairDism.Count -eq 0) {
+        Write-Status "no active RestoreHealth remains after unstuck pass; relaunch check follows."
+        Start-DismRestoreHealth
+    } elseif ($postRepairDism.Count -gt 0) {
+        Write-Status ("DISM RestoreHealth still running PID={0}; leaving active repair to continue." -f ($postRepairDism.Id -join ","))
     } elseif ($postDism.Count -gt 0) {
-        Write-Status ("DISM still running PID={0}; leaving active repair to continue." -f ($postDism.Id -join ","))
+        Write-Status ("non-RepairHealth DISM still running PID={0}; not relaunching repair over unrelated DISM." -f ($postDism.Id -join ","))
     } else {
         Write-Status "no active DISM and no recent DISM failure requiring relaunch."
     }
@@ -203,13 +292,31 @@ function Show-GenericStaleReport {
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
-Write-Status "unstuck-command start DryRun=$DryRun Aggressive=$Aggressive RerunDism=$RerunDism IncludeGenericReport=$IncludeGenericReport SampleSeconds=$SampleSeconds"
+Write-Status "unstuck-command start DryRun=$DryRun Aggressive=$Aggressive RerunDism=$RerunDism IncludeGenericReport=$IncludeGenericReport SampleSeconds=$SampleSeconds MaxMonitorSeconds=$MaxMonitorSeconds"
 
 if (-not (Test-IsAdmin)) {
     Write-Status "WARNING not elevated. Detection works, but stopping service-owned workers may fail. Run the .cmd launcher as Administrator for full repair."
 }
 
-Invoke-ServicingUnstuck
+$deadline = (Get-Date).AddSeconds([Math]::Max(1, $MaxMonitorSeconds))
+$pass = 0
+do {
+    $pass++
+    Write-Status "monitor pass $pass"
+    Invoke-ServicingUnstuck
+    $activeRepair = @(Get-DismRepairProcess -Processes @(Get-ProcByName @("Dism")))
+    if ($activeRepair.Count -eq 0) {
+        Write-Status "no active RestoreHealth repair after pass $pass."
+        break
+    }
+    if ((Get-Date) -ge $deadline) {
+        Write-Status ("monitor timeout reached with active RestoreHealth PID={0}" -f ($activeRepair.Id -join ","))
+        break
+    }
+    Write-Status ("active RestoreHealth PID={0}; next monitor pass in {1}s" -f ($activeRepair.Id -join ","), $MonitorIntervalSeconds)
+    Start-Sleep -Seconds $MonitorIntervalSeconds
+} while ($true)
+
 if ($IncludeGenericReport) {
     Show-GenericStaleReport
 } else {
