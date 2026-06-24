@@ -1,0 +1,1 @@
+﻿& 'F:\study\Windows\PowerShell\System\Maintenance\Servicing\Tools\unstuck-command\Mega-Unfreeze-Win11.ps1'

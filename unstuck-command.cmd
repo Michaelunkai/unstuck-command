@@ -6,8 +6,8 @@ if not exist "%SCRIPT%" (
   exit /b 1
 )
 if "%~1"=="" (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Aggressive -RerunDism
+  powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%SCRIPT%" -Aggressive -RerunDism -IncludeAppReport -IncludeGenericReport -RecoverHungExplorer -RecoverHungTerminalWindows -RecoverHungGenericApps -RecoverStaleTerminalCommands -MaxMonitorSeconds 0
   exit /b %ERRORLEVEL%
 )
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 exit /b %ERRORLEVEL%
